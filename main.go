@@ -1,10 +1,16 @@
 package main
 
 import (
-	"task-golang-db/handler"
-	"task-golang-db/middleware"
+	"context"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
+	"net/http"
+
+	"task-golang-db/handler"
+	"task-golang-db/middleware"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
@@ -13,75 +19,119 @@ import (
 )
 
 func main() {
-	// Env
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file", err)
+	// Load .env file
+	if err := godotenv.Load(); err != nil {
+		log.Fatal("Error loading .env file:", err)
 	}
 
-	// Database
+	// Initialize database
 	db := NewDatabase()
 	sqlDB, err := db.DB()
 	if err != nil {
-		log.Fatal("failed to get DB from GORM:", err)
+		log.Fatal("Failed to get DB from GORM:", err)
 	}
 	defer sqlDB.Close()
 
-	// secret-key
+	// Get signing key from .env
 	signingKey := os.Getenv("SIGNING_KEY")
 
+	// Initialize Gin router
 	r := gin.Default()
 
-	// grouping route with /auth
+	// Initialize Handlers
 	authHandler := handler.NewAuth(db, []byte(signingKey))
-	authRoute := r.Group("/auth")
-	authRoute.POST("/login", authHandler.Login)
-	authRoute.POST("/upsert", authHandler.Upsert)
-
-	// grouping route with /account
 	accountHandler := handler.NewAccount(db)
+	transCatHandler := handler.NewTransactionCategory(db)
+	transactionHandler := handler.NewTransaction(db)
+
+	// Define Routes
+	// Auth routes
+	authRoute := r.Group("/auth")
+	{
+		authRoute.POST("/login", authHandler.Login)
+		authRoute.POST("/upsert", authHandler.Upsert)
+	}
+
+	// Account routes
 	accountRoutes := r.Group("/account")
-	accountRoutes.POST("/create", accountHandler.Create)
-	accountRoutes.GET("/read/:id", accountHandler.Read)
-	accountRoutes.PATCH("/update/:id", accountHandler.Update)
-	accountRoutes.DELETE("/delete/:id", accountHandler.Delete)
-	accountRoutes.GET("/list", accountHandler.List)
+	{
+		accountRoutes.POST("/create", accountHandler.Create)
+		accountRoutes.GET("/read/:id", accountHandler.Read)
+		accountRoutes.PATCH("/update/:id", accountHandler.Update)
+		accountRoutes.DELETE("/delete/:id", accountHandler.Delete)
+		accountRoutes.GET("/list", accountHandler.List)
+		accountRoutes.GET("/my", middleware.AuthMiddleware(signingKey), accountHandler.My)
+		accountRoutes.POST("/topup", middleware.AuthMiddleware(signingKey), accountHandler.Topup)
+		accountRoutes.GET("/balance", middleware.AuthMiddleware(signingKey), accountHandler.Balance)
+		accountRoutes.POST("/transfer", middleware.AuthMiddleware(signingKey), accountHandler.Transfer)
+		accountRoutes.GET("/mutation", middleware.AuthMiddleware(signingKey), accountHandler.Mutation)
+	}
 
-	accountRoutes.GET("/my", middleware.AuthMiddleware(signingKey), accountHandler.My)
+	// Transaction Category routes
+	transCatRoutes := r.Group("/transaction-category")
+	{
+		transCatRoutes.POST("/create", middleware.AuthMiddleware(signingKey), transCatHandler.Create)
+		transCatRoutes.GET("/read/:id", transCatHandler.Read)
+		transCatRoutes.PATCH("/update/:id", transCatHandler.Update)
+		transCatRoutes.DELETE("/delete/:id", transCatHandler.Delete)
+		transCatRoutes.GET("/list", transCatHandler.List)
+	}
 
-	transcatHandler := handler.NewTransactionCategory(db)
-	transcatRoutes := r.Group("/transcat")
-	transcatRoutes.POST("/create", transcatHandler.Create)
-	transcatRoutes.GET("/read/:id", transcatHandler.Read)
-	transcatRoutes.PATCH("/update/:id", transcatHandler.Update)
-	transcatRoutes.DELETE("/delete/:id", transcatHandler.Delete)
-	transcatRoutes.GET("/list", transcatHandler.List)
+	// Transaction routes
+	transactionRoutes := r.Group("/transaction")
+	{
+		transactionRoutes.POST("/create", middleware.AuthMiddleware(signingKey), transactionHandler.NewTransaction)
+		transactionRoutes.GET("/list", middleware.AuthMiddleware(signingKey), transactionHandler.TransactionList)
+	}
 
+	// Graceful shutdown setup
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: r,
+	}
 
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %s\n", err)
+		}
+	}()
 
-	r.Run() // listen and serve on 0.0.0.0:8080 (for windows "localhost:8080")
+	// Wait for interrupt signal to gracefully shutdown the server
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("Shutting down server...")
+
+	// Graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatal("Server forced to shutdown:", err)
+	}
+
+	log.Println("Server exiting")
 }
 
+// NewDatabase initializes the database connection
 func NewDatabase() *gorm.DB {
-	// dsn := "host=localhost port=5432 user=postgres dbname=digi sslmode=disable TimeZone=Asia/Jakarta"
 	dsn := os.Getenv("DATABASE")
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Failed to connect to database:", err)
 	}
 
 	sqlDB, err := db.DB()
 	if err != nil {
-		log.Fatalf("failed to get DB object: %v", err)
+		log.Fatalf("Failed to get DB object: %v", err)
 	}
 
 	var currentDB string
 	err = sqlDB.QueryRow("SELECT current_database()").Scan(&currentDB)
 	if err != nil {
-		log.Fatalf("failed to query current database: %v", err)
+		log.Fatalf("Failed to query current database: %v", err)
 	}
 
-	log.Printf("Current Database: %s\n", currentDB)
+	log.Printf("Connected to database: %s\n", currentDB)
 
 	return db
 }

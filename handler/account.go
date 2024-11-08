@@ -3,9 +3,11 @@ package handler
 import (
 	"task-golang-db/model"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	
 )
 
 type AccountInterface interface {
@@ -14,8 +16,11 @@ type AccountInterface interface {
 	Update(*gin.Context)
 	Delete(*gin.Context)
 	List(*gin.Context)
-
+	Topup(c *gin.Context)
+	Transfer(c *gin.Context)
+	Balance(c *gin.Context)
 	My(*gin.Context)
+	Mutation(*gin.Context)
 }
 
 type accountImplement struct {
@@ -194,4 +199,150 @@ func (a *accountImplement) My(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"data": account,
 	})
+}
+
+func (a *accountImplement) Topup(c *gin.Context) {
+	accountID := c.GetInt64("account_id")
+	var payload struct {
+		Amount int64 `json:"amount"`
+	}
+
+	if err := c.BindJSON(&payload); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if payload.Amount <= 0 {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Invalid topup amount"})
+		return
+	}
+
+	tx := a.db.Begin()
+
+	// Update account balance
+	if err := a.db.Model(&model.Account{}).Where("account_id = ?", accountID).
+		Update("balance", gorm.Expr("balance + ?", payload.Amount)).Error; err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	transaction := model.Transaction{
+		AccountID:       accountID,
+		Amount:          payload.Amount,
+		TransactionDate: time.Now(),
+	}
+	if err := tx.Create(&transaction).Error; err != nil {
+		tx.Rollback()
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Commit transaksi
+	tx.Commit()
+
+	c.JSON(http.StatusOK, gin.H{"message": "Topup successful"})
+}
+
+func (a *accountImplement) Transfer(c *gin.Context) {
+	accountID := c.GetInt64("account_id")
+	var payload struct {
+		TargetAccountID int64 `json:"target_account_id"`
+		Amount          int64 `json:"amount"`
+	}
+
+	if err := c.BindJSON(&payload); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if payload.Amount <= 0 || payload.TargetAccountID == accountID {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Invalid transfer request"})
+		return
+	}
+
+	// Check balance
+	var account model.Account
+	if err := a.db.First(&account, accountID).Error; err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if account.Balance < payload.Amount {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Insufficient balance"})
+		return
+	}
+
+	// Update balances
+	tx := a.db.Begin()
+	if err := tx.Model(&model.Account{}).Where("account_id = ?", accountID).
+		Update("balance", gorm.Expr("balance - ?", payload.Amount)).Error; err != nil {
+		tx.Rollback()
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err := tx.Model(&model.Account{}).Where("account_id = ?", payload.TargetAccountID).
+		Update("balance", gorm.Expr("balance + ?", payload.Amount)).Error; err != nil {
+		tx.Rollback()
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Catat transaksi pengirim
+	transactionSender := model.Transaction{
+		AccountID:       accountID,
+		TransactionCategoryID: nil, // Sesuaikan dengan kategori transaksi
+		Amount:          -payload.Amount, // Saldo berkurang untuk pengirim
+		TransactionDate: time.Now(),
+	}
+	if err := tx.Create(&transactionSender).Error; err != nil {
+		tx.Rollback()
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Catat transaksi penerima
+	transactionReceiver := model.Transaction{
+		AccountID:       payload.TargetAccountID,
+		TransactionCategoryID: nil, // Sesuaikan dengan kategori transaksi
+		Amount:          payload.Amount, // Saldo bertambah untuk penerima
+		TransactionDate: time.Now(),
+	}
+	if err := tx.Create(&transactionReceiver).Error; err != nil {
+		tx.Rollback()
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	tx.Commit()
+	c.JSON(http.StatusOK, gin.H{"message": "Transfer successful"})
+}
+
+func (a *accountImplement) Balance(c *gin.Context) {
+	accountID := c.GetInt64("account_id")
+
+	var balance float64
+	if err := a.db.Model(&model.Account{}).
+		Where("account_id = ?", accountID).
+		Select("balance").
+		Scan(&balance).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve balance"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"balance": balance})
+}
+
+func (a *accountImplement) Mutation(c *gin.Context) {
+	// Ambil account_id dari context setelah authentication
+	accountID := c.GetInt64("account_id")
+
+	var transactions []model.Transaction
+	if err := a.db.Where("account_id = ?", accountID).
+		Order("transaction_date DESC"). // Mengurutkan berdasarkan tanggal transaksi terbaru
+		Limit(10). // Membatasi hasil ke 10 transaksi terakhir
+		Find(&transactions).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve transactions"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"transactions": transactions})
 }
